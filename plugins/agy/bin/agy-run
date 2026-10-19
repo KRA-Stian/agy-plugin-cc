@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# agy-run: the agy plugin's wrapper, on Claude Code's PATH while the plugin is enabled.
+AGY_RUN_CMD="${AGY_RUN_CMD:-agy-run}" exec bash "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../scripts/agy-run.sh" "$@"
