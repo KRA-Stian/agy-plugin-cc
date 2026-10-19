@@ -1,0 +1,29 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unit:
+    name: unit (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Offline tests
+        # macOS runs the wrapper with /bin/bash, which is bash 3.2.
+        env:
+          AGY_TEST_BASH: ${{ matrix.os == 'macos-latest' && '/bin/bash' || 'bash' }}
+        run: |
+          "$AGY_TEST_BASH" --version | head -n 1
+          python3 -m unittest discover -s tests -v
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: shellcheck -S style plugins/agy/scripts/agy-run.sh plugins/agy/bin/agy-run tests/fake-agy/agy
