@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+# Fake `agy` for the offline test suite. It records every call (arguments,
+# working directory, stdin, prompt) under $FAKE_AGY_CALLS_DIR/<n>/ and answers
+# like agy 1.4 in print mode. FAKE_AGY_SCENARIO picks the behaviour:
+#   ok            reply "FAKE-OK model=<model> effort=<effort> conv=<id>"
+#   slow          like ok after sleeping $FAKE_AGY_SLEEP seconds
+#   deny          new conversation: no reply + the headless "auto-denied"
+#                 message; resumed conversation (--conversation): a report
+#   deny-always   always the auto-denied failure
+#   empty         exit 0 with an empty reply and no message
+#   error         exit 1 with an error
+#   image         save a PNG in $AGY_HOME/brain/<conversation>/ and reply
+#   image-missing reply as if an image was made, but save nothing
+#   text-only     ignore --output-format and print plain text
+# --model equal to $FAKE_AGY_UNKNOWN_MODEL fails like an unknown model, and
+# `models` lists $FAKE_AGY_EXTRA_MODELS (tab-separated lines) after the
+# standard lineup.
+set -u
+
+case "${1:-}" in
+  --version)
+    echo "1.4.2-fake"
+    exit 0 ;;
+  models)
+    echo "Fetching available models..." >&2
+    printf '%s\t%s\n' \
+      gemini-4-argon-medium "Gemini 4 Argon (Medium)" gemini-4-argon-high "Gemini 4 Argon (High)" \
+      gemini-4-argon-low "Gemini 4 Argon (Low)" gemini-3.8-flash-high "Gemini 3.8 Flash (High)" \
+      gemini-3.8-flash-medium "Gemini 3.8 Flash (Medium)" gemini-3.8-flash-low "Gemini 3.8 Flash (Low)" \
+      claude-opus-5-5-low "Claude Opus 5.5 (Low)" claude-opus-5-5-medium "Claude Opus 5.5 (Medium)" \
+      claude-opus-5-5-high "Claude Opus 5.5 (High)" claude-sonnet-5-5-low "Claude Sonnet 5.5 (Low)" \
+      claude-sonnet-5-5-medium "Claude Sonnet 5.5 (Medium)" claude-sonnet-5-5-high "Claude Sonnet 5.5 (High)" \
+      gpt-oss-120b-medium "GPT-OSS 120B (Medium)"
+    [ -n "${FAKE_AGY_EXTRA_MODELS:-}" ] && printf '%s\n' "$FAKE_AGY_EXTRA_MODELS"
+    exit 0 ;;
+esac
+
+# Print-mode calls are recorded (not --version / models).
+calls="${FAKE_AGY_CALLS_DIR:-}"
+n=0
+if [ -n "$calls" ]; then
+  mkdir -p "$calls"
+  while :; do
+    n=$((n + 1))
+    mkdir "$calls/$n" 2>/dev/null && break
+  done
+  printf '%s\0' "$@" >"$calls/$n/args"
+  pwd >"$calls/$n/cwd"
+  readlink "/proc/$$/fd/0" >"$calls/$n/stdin" 2>/dev/null || echo unknown >"$calls/$n/stdin"
+fi
+
+
+prompt="" model="" effort="" conv="" fmt=text logf=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -p | --print | --prompt) prompt="${2:-}"; shift 2 ;;
+    --model) model="$2"; shift 2 ;;
+    --effort) effort="$2"; shift 2 ;;
+    --conversation) conv="$2"; shift 2 ;;
+    --output-format) fmt="$2"; shift 2 ;;
+    --log-file) logf="$2"; shift 2 ;;
+    --add-dir | --agent | --mode | --print-timeout | --json-schema | --project) shift 2 ;;
+    *) shift ;;
+  esac
+done
+[ -n "$calls" ] && printf '%s' "$prompt" >"$calls/$n/prompt"
+
+scenario="${FAKE_AGY_SCENARIO:-ok}"
+cid="$conv"
+[ -n "$cid" ] || cid="$(printf '00000000-0000-4000-8000-%012d' "$n")"
+label="${model:-Fake Default (Medium)}"
+
+if [ -n "$logf" ]; then
+  {
+    echo "I1019 14:35:03.376866       1 printmode.go:202] Print mode: starting (promptLength=${#prompt}, model=\"$model\", conversationID=\"$conv\")"
+    echo "I1019 14:35:04.226593       1 model_config_manager.go:340] Propagating selected model override to backend: label=\"$label\""
+    echo "I1019 14:35:05.308226       1 session.go:194] Print mode: conversation=$cid, sending message"
+  } >>"$logf"
+fi
+
+json_str() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\t'/\\t}"
+  printf '"%s"' "$s"
+}
+
+# emit <status> <response> <error>
+emit() {
+  if [ "$fmt" = json ] && [ "$scenario" != text-only ]; then
+    local id="$cid"
+    [ "$1" = ERROR ] && id=""
+    printf '{"conversation_id":%s,"status":%s,"response":%s,' "$(json_str "$id")" "$(json_str "$1")" "$(json_str "$2")"
+    [ -n "$3" ] && printf '"error":%s,' "$(json_str "$3")"
+    printf '"duration_seconds":0.512345,"num_turns":1,"usage":{"input_tokens":10,"output_tokens":5,"thinking_tokens":0,"cache_read_tokens":0,"total_tokens":15}}\n'
+  else
+    printf '%s' "$2"
+  fi
+}
+
+if [ -n "$model" ] && [ "$model" = "${FAKE_AGY_UNKNOWN_MODEL:-}" ]; then
+  msg="invalid model selection (--model \"$model\" --effort \"$effort\"): model $model is not recognized as a known model or custom model in settings"
+  echo "error: $msg" >&2
+  emit ERROR "" "$msg"
+  exit 1
+fi
+
+if [ "$prompt" = /usage ]; then
+  printf 'Gemini Models\tWeekly Limit Remaining\t100%%\t2026-10-26T12:22:43Z\n'
+  printf 'Claude and GPT models\tFive Hour Limit Remaining\t87%%\t2026-10-19T17:30:17Z\n'
+  exit 0
+fi
+
+denied() {
+  echo 'jetski: no output produced — a tool required the "command" permission that headless mode cannot prompt for, so it was auto-denied. Add an allow-rule under permissions.allow in settings.json (e.g. command(<target>)). Alternatively, re-run with --dangerously-skip-permissions to auto-approve all tools.' >&2
+  emit SUCCESS "" ""
+  exit 0
+}
+
+ok_reply="FAKE-OK model=${model:-default} effort=${effort:-none} conv=$cid"
+case "$scenario" in
+  ok | text-only) emit SUCCESS "$ok_reply
+" "" ;;
+  slow)
+    sleep "${FAKE_AGY_SLEEP:-2}"
+    emit SUCCESS "$ok_reply
+" "" ;;
+  deny)
+    [ -n "$conv" ] || denied
+    emit SUCCESS "RECOVERED REPORT conv=$conv
+" "" ;;
+  deny-always) denied ;;
+  empty) emit SUCCESS "" "" ;;
+  error)
+    echo "error: something broke in the fake" >&2
+    emit ERROR "" "something broke in the fake"
+    exit 1 ;;
+  image)
+    mkdir -p "${AGY_HOME:?}/brain/$cid"
+    printf '\x89PNG\r\n\x1a\nfake' >"$AGY_HOME/brain/$cid/${FAKE_AGY_IMAGE_NAME:-image}_1792413076486.png"
+    emit SUCCESS "I've generated the image.
+" "" ;;
+  image-missing) emit SUCCESS "I've generated the image.
+" "" ;;
+  *)
+    echo "fake agy: unknown scenario $scenario" >&2
+    exit 2 ;;
+esac
+exit 0

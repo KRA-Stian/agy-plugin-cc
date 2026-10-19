@@ -18,7 +18,7 @@ AGY_HOME="${AGY_HOME:-$HOME/.gemini/antigravity-cli}"
 STATE_DIR="${AGY_PLUGIN_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/agy-plugin}"
 JOBS_DIR="$STATE_DIR/jobs"
 WAIT_DEFAULT="${AGY_WAIT_SECONDS:-540}"
-POLL_INTERVAL="${AGY_POLL_INTERVAL:-1}"
+POLL_INTERVAL="${AGY_POLL_INTERVAL:-0.5}"
 MAX_ARG_BYTES="${AGY_MAX_ARG_BYTES:-100000}"
 RETENTION_DAYS="${AGY_JOB_RETENTION_DAYS:-7}"
 IMAGE_GRACE="${AGY_IMAGE_GRACE_SECONDS:-30}"
@@ -166,10 +166,10 @@ family_default_level() {
 # a newer model when a built-in alias stops being offered.
 family_pattern() {
   case "$1" in
-    flash) echo '^Gemini [0-9.]+ Flash \(' ;;
-    argon) echo '^Gemini [0-9.]+ Argon \(' ;;
-    opus) echo '^Claude Opus [0-9.]+ \(' ;;
-    sonnet) echo '^Claude Sonnet [0-9.]+ \(' ;;
+    flash) echo '^Gemini [0-9.]+ Flash [(]' ;;
+    argon) echo '^Gemini [0-9.]+ Argon [(]' ;;
+    opus) echo '^Claude Opus [0-9.]+ [(]' ;;
+    sonnet) echo '^Claude Sonnet [0-9.]+ [(]' ;;
     gpt-oss) echo '^GPT-OSS ' ;;
   esac
 }
@@ -351,7 +351,7 @@ prune_jobs() {
     jd="${jd%/}"
     [ -d "$jd" ] && job_done "$jd" || continue
     fin="$(meta_get "$jd" finished)"
-    [ -n "$fin" ] && [ "$fin" -lt "$cutoff" ] && rm -rf "$jd"
+    [ -n "$fin" ] && [ "$fin" -le "$cutoff" ] && rm -rf "$jd"
   done
   return 0
 }
@@ -404,19 +404,34 @@ resolve_job() {
   JD="$JOBS_DIR/$ref"
 }
 
+# How jobs are detached: a new session (setsid, or perl's POSIX::setsid on
+# macOS) so cancel can stop agy and everything it started; plain nohup as a
+# last resort. AGY_DETACH forces one.
+detach_method() {
+  case "${AGY_DETACH:-auto}" in
+    setsid | perl | nohup) echo "$AGY_DETACH" ;;
+    *)
+      if command -v setsid >/dev/null 2>&1; then echo setsid
+      elif command -v perl >/dev/null 2>&1; then echo perl
+      else echo nohup; fi ;;
+  esac
+}
+
 launch_job() {
-  local log="$JD/runner.log"
-  if command -v setsid >/dev/null 2>&1; then
-    meta_set "$JD" detach setsid
-    setsid "$BASH" "$SCRIPT_PATH" _job-run "$JD" </dev/null >>"$log" 2>&1 &
-  elif command -v perl >/dev/null 2>&1; then
-    meta_set "$JD" detach perl
-    perl -e 'use POSIX qw(setsid); setsid(); exec @ARGV or die "exec: $!\n"' \
-      "$BASH" "$SCRIPT_PATH" _job-run "$JD" </dev/null >>"$log" 2>&1 &
-  else
-    meta_set "$JD" detach nohup
-    nohup "$BASH" "$SCRIPT_PATH" _job-run "$JD" </dev/null >>"$log" 2>&1 &
-  fi
+  local log="$JD/runner.log" method
+  method="$(detach_method)"
+  meta_set "$JD" detach "$method"
+  # stdio must not be the caller's: Claude Code's Bash tool would otherwise
+  # wait for the detached runner to close them.
+  case "$method" in
+    setsid)
+      setsid "$BASH" "$SCRIPT_PATH" _job-run "$JD" </dev/null >>"$log" 2>&1 & ;;
+    perl)
+      perl -e 'use POSIX qw(setsid); setsid(); exec @ARGV or die "exec: $!\n"' \
+        "$BASH" "$SCRIPT_PATH" _job-run "$JD" </dev/null >>"$log" 2>&1 & ;;
+    *)
+      nohup "$BASH" "$SCRIPT_PATH" _job-run "$JD" </dev/null >>"$log" 2>&1 & ;;
+  esac
 }
 
 # wait_job <dir> <seconds, 0 = no limit>: 0 when finished, 75 when still
@@ -929,6 +944,85 @@ parse_run_opts() {
   esac
 }
 
+# --args-stdin: slash commands hand over their raw $ARGUMENTS on stdin (via a
+# quoted heredoc, so nothing is shell-expanded). Leading options are parsed
+# here, shell-style ("--model 'Claude Opus 5.5 (High)'" works); the first
+# word that is not an option for this command starts the text, which is kept
+# verbatim. Sets ARGV_OPTS (array) and ARGV_TEXT.
+
+# opt_kind <kind> <token>: value | flag | none
+opt_kind() {
+  case "${2%%=*}" in
+    -m | --model | -e | --effort | --thinking | --resume | --conversation | -C | --cd | --add-dir | \
+      --agent | --mode | --timeout | --json-schema | --project | --agy-arg | --wait) echo value ;;
+    --sandbox | --background | --bg | --raw | --no-recover | --dangerously*) echo flag ;;
+    --name | -o | --output) [ "$1" = image ] && echo value || echo none ;;
+    --base) [ "$1" = review ] && echo value || echo none ;;
+    --no-untracked) [ "$1" = review ] && echo flag || echo none ;;
+    *) echo none ;;
+  esac
+}
+
+ltrim() { printf '%s' "${1#"${1%%[![:space:]]*}"}"; }
+
+# take_token <string>: first word (unquoting '…' or "…") into TOK, rest into REST.
+take_token() {
+  local s="$1" q
+  case "$s" in
+    \"*) q='"' ;;
+    \'*) q="'" ;;
+    *)
+      TOK="${s%%[[:space:]]*}"
+      REST="${s#"$TOK"}"
+      return 0 ;;
+  esac
+  s="${s#?}"
+  case "$s" in *"$q"*) ;; *) return 1 ;; esac
+  TOK="${s%%"$q"*}"
+  REST="${s#*"$q"}"
+}
+
+split_leading_opts() {
+  local kind="$1" s="$2" opt kindof
+  ARGV_OPTS=()
+  while :; do
+    s="$(ltrim "$s")"
+    case "$s" in
+      -- | --[[:space:]]*)
+        s="$(ltrim "${s#--}")"
+        break ;;
+      -?*) ;;
+      *) break ;;
+    esac
+    case "$s" in
+      --*=\"* | --*=\'*)
+        opt="${s%%=*}"
+        take_token "${s#*=}" || break
+        TOK="$opt=$TOK" ;;
+      *) take_token "$s" || break ;;
+    esac
+    kindof="$(opt_kind "$kind" "$TOK")"
+    case "$kindof" in
+      none) break ;;
+      flag)
+        ARGV_OPTS+=("$TOK")
+        s="$REST" ;;
+      value)
+        case "$TOK" in
+          *=*)
+            ARGV_OPTS+=("$TOK")
+            s="$REST" ;;
+          *)
+            opt="$TOK"
+            take_token "$(ltrim "$REST")" || break
+            ARGV_OPTS+=("$opt" "$TOK")
+            s="$REST" ;;
+        esac ;;
+    esac
+  done
+  ARGV_TEXT="$s"
+}
+
 # The user's text: positional words, then (with --stdin) everything on stdin.
 request_text() {
   local text="${O_POS[*]+${O_POS[*]}}" input
@@ -971,9 +1065,18 @@ git_diff_text() {
 
 # start_run <kind> <args...>: build the request, create the job, launch it.
 start_run() {
-  local kind="$1" text prompt bytes
+  local kind="$1" text prompt bytes a args_stdin=0
   shift
-  parse_run_opts "$kind" "$@"
+  local -a argv
+  argv=()
+  for a in "$@"; do
+    if [ "$a" = --args-stdin ]; then args_stdin=1; else argv+=("$a"); fi
+  done
+  if [ "$args_stdin" = 1 ]; then
+    split_leading_opts "$kind" "$(cat)"
+    argv+=(${ARGV_OPTS[@]+"${ARGV_OPTS[@]}"} -- "$ARGV_TEXT")
+  fi
+  parse_run_opts "$kind" ${argv[@]+"${argv[@]}"}
   require_agy
   resolve_model "$O_MODEL" "$O_EFFORT"
   [ -n "$O_CD" ] && { cd "$O_CD" || usage_error "cannot cd to $O_CD"; }
@@ -1087,10 +1190,9 @@ $REVIEW_DIFF
 # --------------------------------------------------------------- commands ---
 
 cmd_check() {
-  local path version models_out rc auth=missing count=0 err="" dm warnings="" detach=nohup
+  local path version models_out rc auth=missing count=0 err="" dm warnings="" detach
   detect_json_helper
-  command -v perl >/dev/null 2>&1 && detach=perl
-  command -v setsid >/dev/null 2>&1 && detach=setsid
+  detach="$(detach_method)"
   if [ -f "$AGY_HOME/settings.json.agy-plugin.bak" ]; then
     warnings="\"Found $(j_esc "$AGY_HOME/settings.json.agy-plugin.bak") left by the old antigravity-plugin-cc (it patched settings.json for --model). Compare it with settings.json, keep the one you want and delete the .bak; this plugin never touches settings.json.\""
   fi
@@ -1110,7 +1212,7 @@ cmd_check() {
     auth=error
     err="$(printf '%s\n' "$models_out" | grep -v '^Fetching' | head -n 3 | tr '\n' ' ')"
     [ -n "$err" ] || err="agy models failed (exit $rc)"
-    err="$err -- run \`agy\` once in a terminal to sign in, or set ANTIGRAVITY_API_KEY"
+    err="$err -- run \`agy\` once in a terminal to sign in (or use Application Default Credentials with AGY_ADC_AUTH)"
   fi
   printf '{\n  "installed": true,\n  "path": "%s",\n  "version": "%s",\n  "auth": "%s",\n  "models_available": %s,\n  "default_model": "%s",\n  "json_helper": "%s",\n  "detach": "%s",\n  "state_dir": "%s",\n  "plugin_version": "%s",\n  "warnings": [%s],\n  "error": "%s"\n}\n' \
     "$(j_esc "$path")" "$(j_esc "$version")" "$auth" "${count:-0}" "$(j_esc "$dm")" "$JSON_HELPER" "$detach" \
@@ -1254,19 +1356,59 @@ cmd_result() {
   print_result "$JD"
 }
 
+# wait [JOB...|all] [--timeout S]: one job prints its result as is; several
+# (e.g. a fan-out started with `start`) print one block per job, all within
+# the same overall timeout.
 cmd_wait() {
-  local ref="" secs="$WAIT_DEFAULT"
+  local secs="$WAIT_DEFAULT" ref id deadline left rc final=0 jd label
+  local -a refs dirs
+  refs=()
   while [ $# -gt 0 ]; do
     case "$1" in
       --timeout) [ $# -ge 2 ] || usage_error "--timeout needs seconds"; secs="$2"; shift 2 ;;
       --timeout=*) secs="${1#*=}"; shift ;;
       -*) usage_error "unknown option '$1' for wait" ;;
-      *) ref="$1"; shift ;;
+      *) refs+=("$1"); shift ;;
     esac
   done
   case "$secs" in '' | *[!0-9]*) usage_error "--timeout needs whole seconds (0 = no limit)" ;; esac
-  resolve_job "${ref:-last}"
-  show_finished_or_wait "$JD" "$secs"
+  if [ "${#refs[@]}" -le 1 ] && [ "${refs[0]:-}" != all ]; then
+    resolve_job "${refs[0]:-last}"
+    show_finished_or_wait "$JD" "$secs"
+    return $?
+  fi
+  dirs=()
+  for ref in "${refs[@]}"; do
+    if [ "$ref" = all ]; then
+      for id in $(ls -1 "$JOBS_DIR" 2>/dev/null | sort); do
+        job_done "$JOBS_DIR/$id" || dirs+=("$JOBS_DIR/$id")
+      done
+    else
+      resolve_job "$ref"
+      dirs+=("$JD")
+    fi
+  done
+  [ "${#dirs[@]}" -gt 0 ] || { echo "No running agy jobs."; return 0; }
+  deadline=$(($(now) + secs))
+  for jd in "${dirs[@]}"; do
+    label="$(meta_get "$jd" model_label)"
+    [ -n "$label" ] || label="$(meta_get "$jd" model)"
+    printf '===== agy job %s (%s, %s) =====\n' "$(meta_get "$jd" id)" "$(meta_get "$jd" kind)" "${label:-default model}"
+    left=0
+    if [ "$secs" -gt 0 ]; then
+      left=$((deadline - $(now)))
+      [ "$left" -ge 1 ] || left=1
+    fi
+    show_finished_or_wait "$jd" "$left"
+    rc=$?
+    echo
+    if [ "$rc" = "$EX_RUNNING" ]; then
+      final="$EX_RUNNING"
+    elif [ "$rc" != 0 ] && [ "$final" = 0 ]; then
+      final="$rc"
+    fi
+  done
+  return "$final"
 }
 
 cancel_one() {
@@ -1335,16 +1477,19 @@ Slash commands (Claude Code)
   /agy:status [job]  /agy:result [job]  /agy:cancel <job>   background jobs
   /agy:models  /agy:usage  /agy:help
 
-Wrapper usage
-  bash agy-run.sh ask      [opts] <question...>
-  bash agy-run.sh task     [opts] <task...>        (alias: delegate)
-  bash agy-run.sh start    [opts] <task...>        (task --background)
-  bash agy-run.sh research [opts] <topic...>
-  bash agy-run.sh review   [opts] [--base REF] [--no-untracked] [focus...]
-  bash agy-run.sh image    [opts] [--name SLUG] [--output PATH] <description...>
-  bash agy-run.sh status [JOB|--all] [--json] | result [JOB] | wait [JOB] [--timeout S]
-  bash agy-run.sh cancel JOB|last|all | prune [--days N]
-  bash agy-run.sh check | models | usage | help | version
+Wrapper usage (agy-run is on Claude Code's PATH while the plugin is enabled;
+elsewhere run: bash <plugin>/scripts/agy-run.sh)
+  agy-run ask      [opts] <question...>
+  agy-run task     [opts] <task...>        (alias: delegate)
+  agy-run start    [opts] <task...>        (task --background)
+  agy-run research [opts] <topic...>
+  agy-run review   [opts] [--base REF] [--no-untracked] [focus...]
+  agy-run image    [opts] [--name SLUG] [--output PATH] <description...>
+  agy-run status [JOB|--all] [--json]      list jobs, or one job's details
+  agy-run result [JOB]                     a finished job's output (default: last)
+  agy-run wait [JOB...|all] [--timeout S]  wait for one or several jobs
+  agy-run cancel JOB|last|all  ·  agy-run prune [--days N]
+  agy-run check | models | usage | help | version
 
 Options for ask / task / start / research / review / image
   -m, --model NAME        alias, display name or model id (table below)
@@ -1358,6 +1503,8 @@ Options for ask / task / start / research / review / image
   --timeout DUR           agy --print-timeout, e.g. 20m
   --json-schema SCHEMA    ask agy for structured output
   --stdin                 read the text from stdin (use a quoted heredoc)
+  --args-stdin            read options + text from stdin, as typed after a
+                          slash command (leading options are parsed)
   --background            start the job and return its id immediately
   --wait SECONDS          how long a foreground call waits (default $WAIT_DEFAULT; 0 = no limit)
   --raw                   task/research/review: send the text without the headless note
@@ -1386,8 +1533,19 @@ HELP
 }
 
 main() {
-  local sub="${1:-help}"
+  local sub="${1:-help}" words
   [ $# -gt 0 ] && shift
+  case "$sub" in
+    status | jobs | result | wait | cancel | prune)
+      # Job commands take plain words, so --args-stdin just splits them.
+      if [ "${1:-}" = --args-stdin ]; then
+        words="$(cat)"
+        set -f
+        # shellcheck disable=SC2086
+        set -- $words
+        set +f
+      fi ;;
+  esac
   case "$sub" in
     check | setup) cmd_check ;;
     ask) start_run ask "$@" ;;
