@@ -1,0 +1,23 @@
+{
+  "name": "agy-plugin-cc",
+  "owner": {
+    "name": "KRA-Stian",
+    "url": "https://github.com/KRA-Stian"
+  },
+  "metadata": {
+    "description": "Google Antigravity CLI (agy) for Claude Code: ask agy questions, delegate tasks to agy subagents, review diffs, research and generate images, with every model and thinking level.",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "agy",
+      "source": "./plugins/agy",
+      "description": "Use the Google Antigravity CLI (agy) from Claude Code: /agy:ask, /agy:delegate, /agy:research, /agy:review, /agy:image, background jobs and per-call model + thinking-level selection.",
+      "version": "1.0.0",
+      "author": {
+        "name": "KRA-Stian",
+        "url": "https://github.com/KRA-Stian"
+      }
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+.DS_Store
+*.log
+.env
+.env.*
+.idea/
+.vscode/
+__pycache__/
+*.pyc
+node_modules/
+
+# local test / eval artefacts
+.test-tmp/
+evals/**/results/
+.antigravitycli/

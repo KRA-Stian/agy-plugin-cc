@@ -1,0 +1,13 @@
+{
+  "name": "agy",
+  "version": "1.0.0",
+  "description": "Use the Google Antigravity CLI (agy) from Claude Code: /agy:ask, /agy:delegate, /agy:research, /agy:review, /agy:image, background jobs and per-call model + thinking-level selection.",
+  "author": {
+    "name": "KRA-Stian",
+    "url": "https://github.com/KRA-Stian"
+  },
+  "homepage": "https://github.com/KRA-Stian/agy-plugin-cc",
+  "repository": "https://github.com/KRA-Stian/agy-plugin-cc",
+  "license": "MIT",
+  "keywords": ["antigravity", "agy", "gemini", "delegation", "subagent"]
+}
