@@ -343,15 +343,23 @@ job_state() {
   fi
 }
 
+# job_ids: every job id, oldest first (ids start with a timestamp).
+job_ids() {
+  local d
+  for d in "$JOBS_DIR"/*/; do
+    [ -d "$d" ] || continue
+    d="${d%/}"
+    printf '%s\n' "${d##*/}"
+  done
+}
+
 prune_jobs() {
-  local days="$1" cutoff jd fin
-  [ -d "$JOBS_DIR" ] || return 0
+  local days="$1" cutoff id fin
   cutoff=$(($(now) - days * 86400))
-  for jd in "$JOBS_DIR"/*/; do
-    jd="${jd%/}"
-    [ -d "$jd" ] && job_done "$jd" || continue
-    fin="$(meta_get "$jd" finished)"
-    [ -n "$fin" ] && [ "$fin" -le "$cutoff" ] && rm -rf "$jd"
+  for id in $(job_ids); do
+    job_done "$JOBS_DIR/$id" || continue
+    fin="$(meta_get "$JOBS_DIR/$id" finished)"
+    if [ -n "$fin" ] && [ "$fin" -le "$cutoff" ]; then rm -rf "${JOBS_DIR:?}/$id"; fi
   done
   return 0
 }
@@ -376,9 +384,8 @@ create_job() {
 }
 
 latest_job() {
-  [ -d "$JOBS_DIR" ] || return 1
   local last
-  last="$(ls -1 "$JOBS_DIR" 2>/dev/null | sort | tail -n 1)"
+  last="$(job_ids | tail -n 1)"
   [ -n "$last" ] && printf '%s\n' "$last"
 }
 
@@ -394,7 +401,7 @@ resolve_job() {
   if [ ! -d "$JOBS_DIR/$ref" ]; then
     matches=""
     count=0
-    for id in $(ls -1 "$JOBS_DIR" 2>/dev/null); do
+    for id in $(job_ids); do
       case "$id" in "$ref"*) matches="$id"; count=$((count + 1)) ;; esac
     done
     [ "$count" = 1 ] || die "$EX_FAIL" "no unique agy job matches '$ref' (see: status)"
@@ -751,7 +758,7 @@ cmd__job_run() {
     succ="$(find_successor "$fam" "$lvl")"
     if [ -n "$succ" ] && [ "$succ" != "$(meta_get "$JD" model)" ]; then
       while [ "$i" -lt "${#BASE_ARGS[@]}" ]; do
-        [ "${BASE_ARGS[$i]}" = --model ] && BASE_ARGS[$((i + 1))]="$succ"
+        [ "${BASE_ARGS[$i]}" = --model ] && BASE_ARGS[i + 1]="$succ"
         i=$((i + 1))
       done
       echo "$(meta_get "$JD" model) is no longer offered by agy; used $succ instead (update the plugin for a refreshed alias table)." >>"$JD/notes.txt"
@@ -822,7 +829,7 @@ cmd__job_run() {
   if [ "$kind" = image ]; then
     finish_image "$cid"
   fi
-  finish_job 0 done
+  finish_job 0 "done"
 }
 
 # ------------------------------------------------------ building requests ---
@@ -934,14 +941,12 @@ parse_run_opts() {
         break ;;
     esac
   done
-  case "$kind" in
-    image) ;;
-    *) [ -z "$O_NAME" ] && [ -z "$O_OUTPUT" ] || usage_error "--name / --output only apply to image" ;;
-  esac
-  case "$kind" in
-    review) ;;
-    *) [ -z "$O_BASE" ] && [ "$O_UNTRACKED" = 1 ] || usage_error "--base / --no-untracked only apply to review" ;;
-  esac
+  if [ "$kind" != image ] && { [ -n "$O_NAME" ] || [ -n "$O_OUTPUT" ]; }; then
+    usage_error "--name / --output only apply to image"
+  fi
+  if [ "$kind" != review ] && { [ -n "$O_BASE" ] || [ "$O_UNTRACKED" != 1 ]; }; then
+    usage_error "--base / --no-untracked only apply to review"
+  fi
 }
 
 # --args-stdin: slash commands hand over their raw $ARGUMENTS on stdin (via a
@@ -1306,7 +1311,7 @@ cmd_status() {
     fi
     return 0
   fi
-  ids="$(ls -1 "$JOBS_DIR" 2>/dev/null | sort -r)"
+  ids="$(job_ids | sort -r)"
   if [ "$json" = 1 ]; then
     printf '['
     for id in $ids; do
@@ -1380,7 +1385,7 @@ cmd_wait() {
   dirs=()
   for ref in "${refs[@]}"; do
     if [ "$ref" = all ]; then
-      for id in $(ls -1 "$JOBS_DIR" 2>/dev/null | sort); do
+      for id in $(job_ids); do
         job_done "$JOBS_DIR/$id" || dirs+=("$JOBS_DIR/$id")
       done
     else
@@ -1441,7 +1446,7 @@ cmd_cancel() {
   local ref="${1:-}" id
   [ -n "$ref" ] || usage_error "cancel needs a job id, 'last' or 'all'"
   if [ "$ref" = all ]; then
-    for id in $(ls -1 "$JOBS_DIR" 2>/dev/null); do
+    for id in $(job_ids); do
       job_done "$JOBS_DIR/$id" || cancel_one "$JOBS_DIR/$id"
     done
     return 0

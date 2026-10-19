@@ -27,7 +27,8 @@ HEADLESS_MARK = "[Delegated from Claude Code: headless agy run]"
 
 class Base(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix="agy-test-"))
+        # resolve(): on macOS /var is a symlink to /private/var and bash reports the latter
+        self.tmp = Path(tempfile.mkdtemp(prefix="agy-test-")).resolve()
         self.work = self.tmp / "work"
         self.work.mkdir()
         self.calls = self.tmp / "calls"

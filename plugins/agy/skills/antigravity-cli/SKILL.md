@@ -35,6 +35,11 @@ AGY_EOF
 options from it (what the slash commands use). Options go before the text.
 Use Bash `timeout: 600000` for foreground calls.
 
+Make every Bash call exactly one `agy-run …` command, as above: no `cd …`
+prefix (use `--cd`), no `$( … )` around it, no pipes or `&&` chains. Plain
+calls match the permission rule `Bash(agy-run *)`; wrapped ones can't be
+checked and get refused.
+
 ## Models and thinking levels
 
 | Alias | Model | Levels (bare alias = default) |
@@ -56,22 +61,33 @@ on separate quotas (`agy-run usage`); honour a model the user names.
 
 ## Spinning up several agy agents
 
+Start one job per task, each in its own Bash call (they can go in the same
+message), then collect them all with one `wait`:
+
 ```bash
 agy-run start --model sonnet --cd /path/a --stdin <<'AGY_EOF'
 …task A…
 AGY_EOF
+```
+
+```bash
 agy-run start --model flash --cd /path/b --stdin <<'AGY_EOF'
 …task B…
 AGY_EOF
-agy-run wait <idA> <idB>          # Bash timeout 600000; exit 75 = still running, call again
 ```
 
-`start` prints the job id at once. `wait` with several ids prints one
-`===== agy job … =====` block per job. You can also run `wait` with
-`run_in_background: true` and carry on until it completes, or launch
-several `agy:runner` subagents in one message. Agents that edit files at the
-same time must not share a working tree: give each its own `git worktree`
-and point `--cd` at it.
+```bash
+agy-run wait <idA> <idB>
+```
+
+`start` prints the job id at once. `wait` (Bash `timeout: 600000`) prints
+one `===== agy job … =====` block per job; exit 75 means some are still
+running, so call it again. You can also run `wait` with
+`run_in_background: true` and carry on until it completes. Several
+`agy:runner` subagents in one message work too, but background subagents
+need `agy-run` to be allowed in the user's permission settings. Agents that
+edit files at the same time must not share a working tree: give each its own
+`git worktree` and point `--cd` at it.
 
 ## What a headless agy can do
 
